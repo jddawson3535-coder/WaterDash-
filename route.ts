@@ -1,2 +1,0 @@
-export const runtime="edge"; const startedAt=Date.now();
-export async function GET(){ return new Response(JSON.stringify({status:"ok", uptime_ms: Date.now()-startedAt, timestamp: new Date().toISOString()}),{status:200, headers:{"content-type":"application/json"}}) }
