@@ -1,1 +1,6 @@
-"use client"; import React from "react"; import { PlanBuilder } from "@/components/PlanBuilder"; export default function Plans(){ return <PlanBuilder/> }
+"use client";
+import { Dashboard } from "../components/Dashboard";
+
+export default function Home() {
+  return <Dashboard />;
+}
