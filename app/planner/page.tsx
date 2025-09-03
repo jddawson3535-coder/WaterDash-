@@ -1,6 +1,6 @@
 "use client";
-import { CommEnergyPlanner } from "../../components/CommEnergyPlanner";
+import { Dashboard } from "../components/Dashboard";
 
-export default function Planner() {
-  return <CommEnergyPlanner />;
+export default function Home() {
+  return <Dashboard />;
 }
