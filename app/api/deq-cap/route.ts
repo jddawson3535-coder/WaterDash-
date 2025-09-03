@@ -1,87 +1,71 @@
-// app/api/deq-cap/route.ts
-import { NextResponse } from "next/server";
+// app/api/echo/[...slug]/route.ts
+import { NextRequest } from "next/server";
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+// If you see env-var issues on Edge, swap to nodejs:
+// export const runtime = "nodejs";
+export const runtime = "edge";
+export const dynamic = "force-dynamic"; // no caching of API responses
 
-const PWS_FIELD = (process.env.DEQ_CAP_PWSID_FIELD || "PWSID").toUpperCase();
-const SCORE_FIELD = (process.env.DEQ_CAP_SCORE_FIELD || "SCORE").toUpperCase();
-const UPDATED_FIELD = (process.env.DEQ_CAP_UPDATED_FIELD || "UPDATED").toUpperCase();
+// Allow-list of ECHO service prefixes we expect to proxy
+const ALLOWED_PREFIXES = [
+  "dsdw_rest_services.",  // SDWIS (drinking water)
+  "eff_rest_services.",   // Effluent/ICIS
+  "echo_rest_services.",  // General ECHO
+];
 
-export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url);
-  const pwsid = (searchParams.get("pwsid") || "").trim();
-  const src = (process.env.DEQ_CAP_SCORE_URL || "").trim();
+function isAllowedSlug(slug: string) {
+  return ALLOWED_PREFIXES.some((p) => slug.startsWith(p));
+}
 
-  if (!pwsid || !src) return NextResponse.json({ score: null, updated: null });
-
+export async function GET(
+  req: NextRequest,
+  { params }: { params: { slug?: string[] } }
+) {
   try {
-    const r = await fetch(src, { cache: "no-store" });
-    if (!r.ok) return NextResponse.json({ score: null, updated: null });
+    const parts = params.slug || [];
+    const slug = parts.join("/").trim();
 
-    const ctype = (r.headers.get("content-type") || "").toLowerCase();
-
-    // ---------- JSON ----------
-    if (ctype.includes("application/json") || src.endsWith(".json")) {
-      const data = await r.json();
-
-      // Accept either an array, or an object with a top-level array property.
-      const arr: any[] = Array.isArray(data)
-        ? data
-        : Array.isArray((data as any).rows)
-        ? (data as any).rows
-        : Array.isArray((data as any).data)
-        ? (data as any).data
-        : [];
-
-      const row =
-        arr.find(
-          (x) =>
-            String(x[PWS_FIELD] ?? x.pwsid ?? x.PWSID ?? "").toUpperCase() ===
-            pwsid.toUpperCase()
-        ) || null;
-
-      return NextResponse.json({
-        score:
-          row?.[SCORE_FIELD] ??
-          row?.score ??
-          (Number.isFinite(Number(row?.SCORE)) ? Number(row?.SCORE) : null) ??
-          null,
-        updated: row?.[UPDATED_FIELD] ?? row?.updated ?? row?.UPDATED ?? null,
-      });
+    if (!slug || !isAllowedSlug(slug)) {
+      return new Response(
+        JSON.stringify({ error: "Invalid or missing ECHO service path." }),
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
     }
 
-    // ---------- CSV ----------
-    // Read text and normalize BOM/CRLF
-    let text = await r.text();
-    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // strip BOM
-    const lines = text.split(/\r?\n/).filter((ln) => ln.trim() !== "");
-    if (lines.length === 0) return NextResponse.json({ score: null, updated: null });
+    const url = new URL(req.url);
+    const qs = url.searchParams;
 
-    // Simple CSV split (no embedded commas/quotes). If you need full CSV parsing later, we can swap in a parser.
-    const split = (s: string) =>
-      s
-        .split(",")
-        .map((v) => v.trim().replace(/^"(.*)"$/, "$1"));
+    // Attach API key
+    const apiKey = process.env.DATA_GOV_API_KEY || "";
+    if (apiKey && !qs.get("api_key")) qs.set("api_key", apiKey);
 
-    const header = split(lines.shift()!).map((h) => h.toUpperCase());
-    const iP = header.indexOf(PWS_FIELD) >= 0 ? header.indexOf(PWS_FIELD) : header.indexOf("PWSID");
-    const iS = header.indexOf(SCORE_FIELD) >= 0 ? header.indexOf(SCORE_FIELD) : header.indexOf("SCORE");
-    const iU = header.indexOf(UPDATED_FIELD) >= 0 ? header.indexOf(UPDATED_FIELD) : header.indexOf("UPDATED");
+    // Default to JSON output
+    if (!qs.get("output")) qs.set("output", "JSON");
 
-    for (const line of lines) {
-      const parts = split(line);
-      if (iP < 0 || !parts[iP]) continue;
-      if (String(parts[iP]).toUpperCase() === pwsid.toUpperCase()) {
-        const n = Number(parts[iS]);
-        const score = Number.isFinite(n) ? n : null;
-        const updated = iU >= 0 ? parts[iU] || null : null;
-        return NextResponse.json({ score, updated });
-      }
-    }
+    // Recommended host for ECHO web services
+    const upstream = `https://api.epa.gov/echo/${slug}?${qs.toString()}`;
 
-    return NextResponse.json({ score: null, updated: null });
-  } catch {
-    return NextResponse.json({ score: null, updated: null });
+    const res = await fetch(upstream, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        ...(apiKey ? { "X-Api-Key": apiKey } : {}),
+      },
+      cache: "no-store",
+    });
+
+    // Pass-through body and content-type
+    const body = await res.text();
+    const contentType = res.headers.get("content-type") || "application/json";
+
+    return new Response(body, {
+      status: res.status,
+      headers: { "content-type": contentType },
+    });
+  } catch (e: any) {
+    return new Response(
+      JSON.stringify({ error: e?.message || "Proxy error" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
   }
 }
