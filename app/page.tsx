@@ -1,86 +1,103 @@
-"use client";
-export const config = {
-api: {
-bodyParser: false,
-},
-};
+// app/api/pws/route.ts
+import { NextResponse } from "next/server";
 
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic"; // disable caching
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-const { state, pwsid, health } = req.query as Record<string, string>;
-const apiKey = process.env.DATA_GOV_API_KEY || "";
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
 
+  // Inputs
+  const state = (searchParams.get("state") || "").toUpperCase();
+  const pwsid = searchParams.get("pwsid") || "";
+  const health = searchParams.get("health") === "1"; // optional health probe
+  const apiKey = process.env.DATA_GOV_API_KEY || "";
 
-// Health probe
-if (health) {
-const probeURL = new URL("https://api.data.gov/echo/eff_rest_services.get_facility_info");
-if (apiKey) {
-probeURL.searchParams.set("p_uc", "Y");
-}
+  // ---- Health probe ----
+  if (health) {
+    const probeURL = new URL("https://api.epa.gov/echo/eff_rest_services.get_facility_info");
+    probeURL.searchParams.set("p_uc", "Y");
+    if (apiKey) probeURL.searchParams.set("api_key", apiKey);
 
+    let proxyOK = false;
+    let probeStatus = 0;
+    try {
+      const r = await fetch(probeURL.toString(), {
+        method: "GET",
+        headers: apiKey ? { "X-Api-Key": apiKey, Accept: "application/json" } : { Accept: "application/json" },
+        cache: "no-store",
+      });
+      proxyOK = r.ok;
+      probeStatus = r.status;
+    } catch {
+      proxyOK = false;
+      probeStatus = 0;
+    }
+    return NextResponse.json({ hasKey: !!apiKey, proxyOK, probeStatus });
+  }
 
-let proxyOK = false;
-let probeStatus = 0;
-try {
-const r = await fetch(probeURL.toString(), {
-method: "GET",
-headers: apiKey ? { "X-Api-Key": apiKey } : undefined,
-cache: "no-store",
-});
-proxyOK = r.ok;
-probeStatus = r.status;
-} catch (e) {
-proxyOK = false;
-probeStatus = 0;
-}
-return res.status(200).json({ hasKey: !!apiKey, proxyOK, probeStatus });
-}
+  // ---- Input validation ----
+  if (!apiKey) {
+    return NextResponse.json({ error: true, message: "DATA_GOV_API_KEY missing" }, { status: 403 });
+  }
+  if (!pwsid) {
+    return NextResponse.json({ error: true, message: "pwsid required" }, { status: 400 });
+  }
 
+  // ---- Upstream (✅ correct host) ----
+  // ECHO SDWIS systems endpoint
+  const upstream = new URL("https://api.epa.gov/echo/dsdw_rest_services.get_systems");
+  if (state) upstream.searchParams.set("state", state);
+  upstream.searchParams.set("pwsid", pwsid);
+  upstream.searchParams.set("output", "JSON");
+  upstream.searchParams.set("api_key", apiKey); // also send as query for compatibility
 
-// Build upstream URL – ECHO SDWIS endpoint
-// NOTE: ECHO often expects API keys via the X-Api-Key header. We still append the query param for compatibility, but header is authoritative.
-const upstream = new URL("https://api.data.gov/echo/dsdw_rest_services.get_systems");
-if (state) upstream.searchParams.set("state", state);
-if (pwsid) upstream.searchParams.set("pwsid", pwsid);
+  const upstreamUrl = upstream.toString();
+  console.log("[/api/pws] ->", upstreamUrl);
 
+  try {
+    const resp = await fetch(upstreamUrl, {
+      method: "GET",
+      headers: {
+        "X-Api-Key": apiKey,      // header auth (belt + suspenders)
+        Accept: "application/json",
+      },
+      cache: "no-store",
+    });
 
-try {
-const upstreamRes = await fetch(upstream.toString(), {
-method: "GET",
-headers: apiKey ? { "X-Api-Key": apiKey } : undefined,
-cache: "no-store",
-});
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      return new NextResponse(text.slice(0, 4000), {
+        status: resp.status,
+        headers: { "content-type": resp.headers.get("content-type") || "text/plain" },
+      });
+    }
 
+    // Try to parse JSON
+    let payload: any;
+    try {
+      payload = await resp.json();
+    } catch {
+      const text = await resp.text().catch(() => "");
+      return NextResponse.json(
+        { error: true, status: 502, message: "Non-JSON response from upstream.", body: text.slice(0, 4000), upstreamUrl },
+        { status: 502 }
+      );
+    }
 
-// Basic logging (redact key)
-const safeURL = new URL(upstream.toString());
-console.log(`[echo-proxy] GET ${safeURL.toString()} -> ${upstreamRes.status}`);
+    // Normalize
+    const systems = Array.isArray(payload?.Results) ? payload.Results : payload?.systems || [];
+    const violations = Array.isArray(payload?.Violations) ? payload.Violations : payload?.violations || [];
 
-
-if (!upstreamRes.ok) {
-const text = await upstreamRes.text();
-// Pass through upstream status and body to help debugging
-return res.status(upstreamRes.status).json({ error: true, status: upstreamRes.status, body: text.slice(0, 4000) });
-}
-
-
-// Normalize shape into { systems: [], violations: [] }
-let payload: any = null;
-try {
-payload = await upstreamRes.json();
-} catch (e) {
-const text = await upstreamRes.text();
-return res.status(502).json({ error: true, status: 502, body: text.slice(0, 4000), message: "Non-JSON response from upstream." });
-}
-
-
-const systems = Array.isArray(payload?.Results) ? payload.Results : payload?.systems || [];
-const violations = Array.isArray(payload?.Violations) ? payload.Violations : payload?.violations || [];
-
-
-return res.status(200).json({ systems, violations, meta: { source: "api.data.gov", fetchedAt: new Date().toISOString() } });
-} catch (e: any) {
-console.error("[echo-proxy] upstream fetch failed:", e?.message || e);
-return res.status(502).json({ error: true, status: 502, message: "Upstream unreachable from server." });
-}
+    return NextResponse.json({
+      systems,
+      violations,
+      meta: { source: "api.epa.gov", fetchedAt: new Date().toISOString(), upstreamUrl },
+    });
+  } catch (e: any) {
+    return NextResponse.json(
+      { error: true, status: 502, message: "Upstream unreachable", detail: e?.message },
+      { status: 502 }
+    );
+  }
 }
