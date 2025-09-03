@@ -2,7 +2,7 @@
 import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic"; // disable caching
+export const dynamic = "force-dynamic"; // no caching
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -23,16 +23,17 @@ export async function GET(request: Request) {
     );
   }
 
-  const upstream = new URL(
-    "https://api.data.gov/echo/dsdw_rest_services.get_systems"
-  );
+  // ✅ Use api.epa.gov for ECHO SDWIS
+  const upstream = new URL("https://api.epa.gov/echo/dsdw_rest_services.get_systems");
   if (state) upstream.searchParams.set("state", state);
   upstream.searchParams.set("pwsid", pwsid);
+  // send key both ways for maximum compatibility
+  upstream.searchParams.set("api_key", apiKey);
 
   try {
     const resp = await fetch(upstream.toString(), {
       method: "GET",
-      headers: { "X-Api-Key": apiKey },
+      headers: { "X-Api-Key": apiKey }, // belt & suspenders
       cache: "no-store",
     });
 
@@ -40,9 +41,7 @@ export async function GET(request: Request) {
       const text = await resp.text().catch(() => "");
       return new NextResponse(text.slice(0, 4000), {
         status: resp.status,
-        headers: {
-          "content-type": resp.headers.get("content-type") || "text/plain",
-        },
+        headers: { "content-type": resp.headers.get("content-type") || "text/plain" },
       });
     }
 
@@ -52,27 +51,18 @@ export async function GET(request: Request) {
     } catch {
       const text = await resp.text().catch(() => "");
       return NextResponse.json(
-        {
-          error: true,
-          status: 502,
-          message: "Non-JSON response from upstream.",
-          body: text.slice(0, 4000),
-        },
+        { error: true, status: 502, message: "Non-JSON response from upstream.", body: text.slice(0, 4000) },
         { status: 502 }
       );
     }
 
-    const systems = Array.isArray(payload?.Results)
-      ? payload.Results
-      : payload?.systems || [];
-    const violations = Array.isArray(payload?.Violations)
-      ? payload.Violations
-      : payload?.violations || [];
+    const systems = Array.isArray(payload?.Results) ? payload.Results : payload?.systems || [];
+    const violations = Array.isArray(payload?.Violations) ? payload.Violations : payload?.violations || [];
 
     return NextResponse.json({
       systems,
       violations,
-      meta: { source: "api.data.gov", fetchedAt: new Date().toISOString() },
+      meta: { source: "api.epa.gov", fetchedAt: new Date().toISOString() },
     });
   } catch (e: any) {
     return NextResponse.json(
